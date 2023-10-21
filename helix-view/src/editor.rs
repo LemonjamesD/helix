@@ -43,9 +43,8 @@ pub use helix_core::diagnostic::Severity;
 use helix_core::{
     auto_pairs::AutoPairs,
     syntax::{self, AutoPairConfig, SoftWrap},
-    Change, LineEnding, NATIVE_LINE_ENDING,
+    Change, LineEnding, Position, Selection, NATIVE_LINE_ENDING,
 };
-use helix_core::{Position, Selection};
 use helix_dap as dap;
 use helix_lsp::lsp;
 
@@ -212,6 +211,30 @@ impl Default for FilePickerConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct ExplorerConfig {
+    pub position: ExplorerPosition,
+    /// explorer column width
+    pub column_width: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExplorerPosition {
+    Left,
+    Right,
+}
+
+impl Default for ExplorerConfig {
+    fn default() -> Self {
+        Self {
+            position: ExplorerPosition::Left,
+            column_width: 36,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct Config {
     /// Padding to keep between the edge of the screen and the cursor when scrolling. Defaults to 5.
     pub scrolloff: usize,
@@ -270,6 +293,9 @@ pub struct Config {
     /// Search configuration.
     #[serde(default)]
     pub search: SearchConfig,
+    /// Picker configuration
+    #[serde(default)]
+    pub picker_title: PickerTitle,
     pub lsp: LspConfig,
     pub terminal: Option<TerminalConfig>,
     /// Column numbers at which to draw the rulers. Defaults to `[]`, meaning no rulers.
@@ -282,7 +308,11 @@ pub struct Config {
     pub indent_guides: IndentGuidesConfig,
     /// Whether to color modes with different colors. Defaults to `false`.
     pub color_modes: bool,
+    /// explore config
+    pub explorer: ExplorerConfig,
     pub soft_wrap: SoftWrap,
+    /// Whether or not the word under the cursor shall be highlighted
+    pub cursor_word: bool,
     /// Workspace specific lsp ceiling dirs
     pub workspace_lsp_roots: Vec<PathBuf>,
     /// Contextual information on top of the viewport
@@ -293,6 +323,10 @@ pub struct Config {
     pub insert_final_newline: bool,
     /// Enables smart tab
     pub smart_tab: Option<SmartTabConfig>,
+    /// Draw border around popups.
+    pub popup_border: PopupBorderConfig,
+    /// Whether to render rainbow highlights. Defaults to `false`.
+    pub rainbow_brackets: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Eq, PartialOrd, Ord)]
@@ -439,6 +473,22 @@ pub struct SearchConfig {
     pub smart_case: bool,
     /// Whether the search should wrap after depleting the matches. Default to true.
     pub wrap_around: bool,
+}
+
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PickerTitle {
+    /// Don't render the title
+    #[default]
+    Never,
+    /// Render on top of picker box
+    Center,
+    /// Render inline with the picker's border
+    Inline,
+    /// Render inline with the picker's border
+    InlineBorder,
+    /// Render title in the prompt line
+    Prompt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -774,11 +824,20 @@ impl Default for WhitespaceCharacters {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RainbowIndentOptions {
+    None,
+    Dim,
+    Normal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct IndentGuidesConfig {
     pub render: bool,
     pub character: char,
     pub skip_levels: u8,
+    pub rainbow_option: RainbowIndentOptions,
 }
 
 impl Default for IndentGuidesConfig {
@@ -787,6 +846,7 @@ impl Default for IndentGuidesConfig {
             skip_levels: 0,
             render: false,
             character: '│',
+            rainbow_option: RainbowIndentOptions::None,
         }
     }
 }
@@ -836,6 +896,15 @@ impl From<LineEndingConfig> for LineEnding {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PopupBorderConfig {
+    None,
+    All,
+    Popup,
+    Menu,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -866,6 +935,7 @@ impl Default for Config {
             true_color: false,
             undercurl: false,
             search: SearchConfig::default(),
+            picker_title: PickerTitle::default(),
             lsp: LspConfig::default(),
             terminal: get_terminal_provider(),
             rulers: Vec::new(),
@@ -873,10 +943,12 @@ impl Default for Config {
             bufferline: BufferLine::default(),
             indent_guides: IndentGuidesConfig::default(),
             color_modes: false,
+            explorer: ExplorerConfig::default(),
             soft_wrap: SoftWrap {
                 enable: Some(false),
                 ..SoftWrap::default()
             },
+            cursor_word: false,
             text_width: 80,
             completion_replace: false,
             workspace_lsp_roots: Vec::new(),
@@ -884,6 +956,8 @@ impl Default for Config {
             default_line_ending: LineEndingConfig::default(),
             insert_final_newline: true,
             smart_tab: Some(SmartTabConfig::default()),
+            popup_border: PopupBorderConfig::None,
+            rainbow_brackets: false,
         }
     }
 }
@@ -980,6 +1054,9 @@ pub struct Editor {
     /// avoid calculating the cursor position multiple
     /// times during rendering and should not be set by other functions.
     pub cursor_cache: Cell<Option<Option<Position>>>,
+
+    /// Contains all the cursor word highlights
+    pub cursor_highlights: Arc<Vec<std::ops::Range<usize>>>,
     /// When a new completion request is sent to the server old
     /// unfinished request must be dropped. Each completion
     /// request is associated with a channel that cancels
@@ -988,6 +1065,8 @@ pub struct Editor {
     /// field is set and any old requests are automatically
     /// canceled as a result
     pub completion_request_handle: Option<oneshot::Sender<()>>,
+    pub popup_border: bool,
+    pub menu_border: bool,
 }
 
 pub type Motion = Box<dyn Fn(&mut Editor)>;
@@ -1049,6 +1128,18 @@ pub enum CloseError {
     SaveError(anyhow::Error),
 }
 
+impl From<CloseError> for anyhow::Error {
+    fn from(error: CloseError) -> Self {
+        match error {
+            CloseError::DoesNotExist => anyhow::anyhow!("Document doesn't exist"),
+            CloseError::BufferModified(error) => {
+                anyhow::anyhow!(format!("Buffer modified: '{error}'"))
+            }
+            CloseError::SaveError(error) => anyhow::anyhow!(format!("Save error: {error}")),
+        }
+    }
+}
+
 impl Editor {
     pub fn new(
         mut area: Rect,
@@ -1099,7 +1190,12 @@ impl Editor {
             config_events: unbounded_channel(),
             needs_redraw: false,
             cursor_cache: Cell::new(None),
+            cursor_highlights: Arc::new(Vec::new()),
             completion_request_handle: None,
+            popup_border: conf.popup_border == PopupBorderConfig::All
+                || conf.popup_border == PopupBorderConfig::Popup,
+            menu_border: conf.popup_border == PopupBorderConfig::All
+                || conf.popup_border == PopupBorderConfig::Menu,
         }
     }
 
@@ -1130,6 +1226,10 @@ impl Editor {
     pub fn refresh_config(&mut self) {
         let config = self.config();
         self.auto_pairs = (&config.auto_pairs).into();
+        self.popup_border = config.popup_border == PopupBorderConfig::All
+            || config.popup_border == PopupBorderConfig::Popup;
+        self.menu_border = config.popup_border == PopupBorderConfig::All
+            || config.popup_border == PopupBorderConfig::Menu;
         self.reset_idle_timer();
         self._refresh();
     }
@@ -1202,8 +1302,7 @@ impl Editor {
             return;
         }
 
-        let scopes = theme.scopes();
-        self.syn_loader.set_scopes(scopes.to_vec());
+        self.syn_loader.set_scopes(theme.scopes().to_vec());
 
         match preview {
             ThemeAction::Preview => {

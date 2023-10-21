@@ -6,11 +6,12 @@ use crate::{
     keymap::{KeymapResult, Keymaps},
     ui::{
         document::{render_document, LinePos, TextRenderer, TranslatedPosition},
-        Completion, ProgressSpinners,
+        Completion, Explorer, ProgressSpinners,
     },
 };
 
 use helix_core::{
+    chars::char_is_word,
     diagnostic::NumberOrString,
     graphemes::{
         ensure_grapheme_boundary_next_byte, next_grapheme_boundary, prev_grapheme_boundary,
@@ -23,7 +24,7 @@ use helix_core::{
 };
 use helix_view::{
     document::{Mode, SavePoint, SCRATCH_BUFFER_NAME},
-    editor::{CompleteAction, CursorShapeConfig},
+    editor::{CompleteAction, CursorShapeConfig, ExplorerPosition},
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
@@ -50,6 +51,7 @@ pub struct EditorView {
     sticky_nodes: Option<Vec<StickyNode>>,
     /// Tracks if the terminal window is focused by reaction to terminal focus events
     terminal_focused: bool,
+    pub(crate) explorer: Option<Explorer>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +82,7 @@ impl EditorView {
             spinners: ProgressSpinners::default(),
             sticky_nodes: None,
             terminal_focused: true,
+            explorer: None,
         }
     }
 
@@ -100,6 +103,11 @@ impl EditorView {
         let area = view.area;
         let theme = &editor.theme;
         let config = editor.config();
+
+        let should_render_rainbow_brackets = doc
+            .language_config()
+            .and_then(|lang_config| lang_config.rainbow_brackets)
+            .unwrap_or(config.rainbow_brackets);
 
         let text_annotations = view.text_annotations(doc, Some(theme));
         let mut line_decorations: Vec<Box<dyn LineDecoration>> = Vec::new();
@@ -132,6 +140,12 @@ impl EditorView {
 
         let mut highlights =
             Self::doc_syntax_highlights(doc, view.offset.anchor, inner.height, theme);
+        if should_render_rainbow_brackets {
+            highlights = Box::new(syntax::merge(
+                highlights,
+                Self::doc_rainbow_highlights(doc, view.offset.anchor, inner.height, theme),
+            ));
+        }
         let overlay_highlights = Self::overlay_syntax_highlights(
             doc,
             view.offset.anchor,
@@ -140,6 +154,14 @@ impl EditorView {
         );
         if !overlay_highlights.is_empty() {
             highlights = Box::new(syntax::merge(highlights, overlay_highlights));
+        }
+
+        if config.cursor_word {
+            if let Some(cursor_word_highlights) =
+                Self::collect_cursor_word_highlights(doc, editor, view, viewport, theme)
+            {
+                highlights = Box::new(syntax::merge(highlights, cursor_word_highlights));
+            }
         }
 
         for diagnostic in Self::doc_diagnostics_highlights(doc, theme) {
@@ -276,6 +298,103 @@ impl EditorView {
             .for_each(|area| surface.set_style(area, ruler_theme))
     }
 
+    /// Gets the word under the cursor
+    pub fn cursor_word<'a>(doc: &'a Document, view: &View) -> Option<&'a str> {
+        let text = doc.text().slice(..);
+        let cursor = doc.selection(view.id).primary().cursor(text);
+        let char_under_cursor = text.get_char(cursor);
+        if !char_under_cursor.map_or(false, char_is_word) {
+            return None;
+        }
+
+        let chars_at_cursor = text.chars_at(cursor);
+        let reversed_chars = chars_at_cursor.clone().reversed();
+        let start = cursor.saturating_sub(reversed_chars.take_while(|c| char_is_word(*c)).count());
+        let end = cursor + chars_at_cursor.take_while(|c| char_is_word(*c)).count();
+
+        text.slice(start..end).as_str()
+    }
+
+    /// Calculates the ranges of the word under the cursor and returns the result
+    fn calculate_cursor_word(
+        doc: &Document,
+        view: &View,
+        viewport: Rect,
+        scope_index: usize,
+    ) -> Vec<(usize, std::ops::Range<usize>)> {
+        let text = doc.text().slice(..);
+        let mut result = Vec::new();
+
+        let Some(cursor_word) = Self::cursor_word(doc, view) else {
+            return result;
+        };
+
+        let row = text.char_to_line(view.offset.anchor.min(text.len_chars()));
+        let line_range = {
+            // Calculate the lines in view
+            let last_line = text.len_lines().saturating_sub(1);
+            let last_visible_line = (row + viewport.height as usize).min(last_line);
+            let first_visible_line = row;
+
+            first_visible_line..last_visible_line
+        };
+
+        let relevant_lines = text
+            .slice(text.line_to_char(line_range.start)..text.line_to_char(line_range.end))
+            .chunks();
+
+        for (line, line_number) in relevant_lines.zip(line_range) {
+            result.extend(
+                line.match_indices(cursor_word)
+                    .map(|(i, _)| i)
+                    .filter(|i| line[..*i].chars().next_back().map_or(false, char_is_word))
+                    .filter(|i| {
+                        !line
+                            .chars()
+                            .nth(i + cursor_word.len())
+                            .map_or(false, char_is_word)
+                    })
+                    .map(|i| line_number + i)
+                    .map(|start| (scope_index, { start..start + cursor_word.len() })),
+            );
+        }
+
+        result
+    }
+
+    /// Apply the decoration for the word to be highlighted
+    pub fn collect_cursor_word_highlights(
+        doc: &Document,
+        editor: &Editor,
+        view: &View,
+        viewport: Rect,
+        theme: &Theme,
+    ) -> Option<Vec<(usize, std::ops::Range<usize>)>> {
+        let scope_index = theme.find_scope_index("ui.wordmatch")?;
+        let mut result: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
+        let lsp_supports_highlights = doc
+            .language_servers_with_feature(syntax::LanguageServerFeature::DocumentHighlight)
+            .count()
+            > 0;
+
+        match lsp_supports_highlights {
+            true => result.extend(
+                editor
+                    .cursor_highlights
+                    .iter()
+                    .map(|range| (scope_index, range.to_owned())),
+            ),
+            false => result.extend(Self::calculate_cursor_word(
+                doc,
+                view,
+                viewport,
+                scope_index,
+            )),
+        }
+
+        Some(result)
+    }
+
     pub fn overlay_syntax_highlights(
         doc: &Document,
         anchor: usize,
@@ -351,6 +470,48 @@ impl EditorView {
                 .into_iter(),
             ),
         }
+    }
+
+    pub fn doc_rainbow_highlights(
+        doc: &Document,
+        anchor: usize,
+        height: u16,
+        theme: &Theme,
+    ) -> Vec<(usize, std::ops::Range<usize>)> {
+        let syntax = match doc.syntax() {
+            Some(syntax) => syntax,
+            None => return Vec::new(),
+        };
+
+        let text = doc.text().slice(..);
+        let row = text.char_to_line(anchor.min(text.len_chars()));
+
+        // calculate viewport byte ranges
+        let last_line = doc.text().len_lines().saturating_sub(1);
+        let last_visible_line = (row + height as usize).saturating_sub(1).min(last_line);
+        let visible_start = text.line_to_byte(row.min(last_line));
+        let visible_end = text.line_to_byte(last_visible_line + 1);
+
+        // The calculation for the current nesting level for rainbow highlights
+        // depends on where we start the iterator from. For accuracy, we start
+        // the iterator further back than the viewport: at the start of the containing
+        // non-root syntax-tree node. Any spans that are off-screen are truncated when
+        // the spans are merged via [syntax::merge].
+        let syntax_node_start =
+            syntax::child_for_byte_range(syntax.tree().root_node(), visible_start..visible_start)
+                .map_or(visible_start, |node| node.byte_range().start);
+        let syntax_node_range = syntax_node_start..visible_end;
+
+        let mut spans = syntax.rainbow_spans(text, Some(syntax_node_range), theme.rainbow_length());
+
+        for (_highlight, range) in spans.iter_mut() {
+            let start = text.byte_to_char(ensure_grapheme_boundary_next_byte(text, range.start));
+            let end = text.byte_to_char(ensure_grapheme_boundary_next_byte(text, range.end));
+
+            *range = start..end;
+        }
+
+        spans
     }
 
     /// Get highlight spans for document diagnostics
@@ -1060,6 +1221,10 @@ impl EditorView {
             };
         }
 
+        if cx.editor.config().cursor_word {
+            crate::commands::highlight_symbol_under_cursor(cx);
+        }
+
         if cx.editor.mode != Mode::Insert || !cx.editor.config().auto_completion {
             return EventResult::Ignored(None);
         }
@@ -1275,6 +1440,11 @@ impl Component for EditorView {
         event: &Event,
         context: &mut crate::compositor::Context,
     ) -> EventResult {
+        if let Some(explore) = self.explorer.as_mut() {
+            if let EventResult::Consumed(callback) = explore.handle_event(event, context) {
+                return EventResult::Consumed(callback);
+            }
+        }
         let mut cx = commands::Context {
             editor: context.editor,
             count: None,
@@ -1441,6 +1611,8 @@ impl Component for EditorView {
         surface.set_style(area, cx.editor.theme.get("ui.background"));
         let config = cx.editor.config();
 
+        let editor_area = area.clip_bottom(1);
+
         // check if bufferline should be rendered
         use helix_view::editor::BufferLine;
         let use_bufferline = match config.bufferline {
@@ -1449,14 +1621,42 @@ impl Component for EditorView {
             _ => false,
         };
 
-        // -1 for commandline and -1 for bufferline
-        let mut editor_area = area.clip_bottom(1);
-        if use_bufferline {
-            editor_area = editor_area.clip_top(1);
-        }
+        let editor_area = if use_bufferline {
+            editor_area.clip_top(1)
+        } else {
+            editor_area
+        };
+
+        let editor_area = if let Some(explorer) = &self.explorer {
+            let explorer_column_width = if explorer.is_opened() {
+                explorer.column_width().saturating_add(2)
+            } else {
+                0
+            };
+            // For future developer:
+            // We should have a Dock trait that allows a component to dock to the top/left/bottom/right
+            // of another component.
+            match config.explorer.position {
+                ExplorerPosition::Left => editor_area.clip_left(explorer_column_width),
+                ExplorerPosition::Right => editor_area.clip_right(explorer_column_width),
+            }
+        } else {
+            editor_area
+        };
 
         // if the terminal size suddenly changed, we need to trigger a resize
         cx.editor.resize(editor_area);
+
+        if let Some(explorer) = self.explorer.as_mut() {
+            if !explorer.is_focus() {
+                let area = if use_bufferline {
+                    area.clip_top(1)
+                } else {
+                    area
+                };
+                explorer.render(area, surface, cx);
+            }
+        }
 
         if use_bufferline {
             Self::render_bufferline(cx.editor, area.with_height(1), surface);
@@ -1536,9 +1736,28 @@ impl Component for EditorView {
         if let Some(completion) = self.completion.as_mut() {
             completion.render(area, surface, cx);
         }
+
+        if let Some(explore) = self.explorer.as_mut() {
+            if explore.is_focus() {
+                let area = if use_bufferline {
+                    area.clip_top(1)
+                } else {
+                    area
+                };
+                explore.render(area, surface, cx);
+            }
+        }
     }
 
     fn cursor(&self, _area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
+        if let Some(explore) = &self.explorer {
+            if explore.is_focus() {
+                let cursor = explore.cursor(_area, editor);
+                if cursor.0.is_some() {
+                    return cursor;
+                }
+            }
+        }
         match editor.cursor() {
             // All block cursors are drawn manually
             (pos, CursorKind::Block) => (pos, CursorKind::Hidden),

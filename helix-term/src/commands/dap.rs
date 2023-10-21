@@ -8,7 +8,7 @@ use dap::{StackFrame, Thread, ThreadStates};
 use helix_core::syntax::{DebugArgumentValue, DebugConfigCompletion, DebugTemplate};
 use helix_dap::{self as dap, Client};
 use helix_lsp::block_on;
-use helix_view::editor::Breakpoint;
+use helix_view::{editor::Breakpoint, graphics::Margin};
 
 use serde_json::{to_value, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -73,9 +73,13 @@ fn thread_picker(
             let debugger = debugger!(editor);
 
             let thread_states = debugger.thread_states.clone();
-            let picker = Picker::new(threads, thread_states, move |cx, thread, _action| {
-                callback_fn(cx.editor, thread)
-            })
+            let picker_title = String::from("Thread Picker");
+            let picker = Picker::new(
+                picker_title,
+                threads,
+                thread_states,
+                move |cx, thread, _action| callback_fn(cx.editor, thread),
+            )
             .with_preview(move |editor, thread| {
                 let frames = editor.debugger.as_ref()?.stack_frames.get(&thread.id)?;
                 let frame = frames.get(0)?;
@@ -268,7 +272,9 @@ pub fn dap_launch(cx: &mut Context) {
 
     let templates = config.templates.clone();
 
+    let picker_title = String::from("DAP Picker");
     cx.push_layer(Box::new(overlaid(Picker::new(
+        picker_title,
         templates,
         (),
         |cx, template, _action| {
@@ -581,7 +587,12 @@ pub fn dap_variables(cx: &mut Context) {
     }
 
     let contents = Text::from(tui::text::Text::from(variables));
-    let popup = Popup::new("dap-variables", contents);
+    let margin = if cx.editor.popup_border {
+        Margin::all(1)
+    } else {
+        Margin::none()
+    };
+    let popup = Popup::new("dap-variables", contents).margin(margin);
     cx.replace_or_push_layer("dap-variables", popup);
 }
 
@@ -730,7 +741,8 @@ pub fn dap_switch_stack_frame(cx: &mut Context) {
 
     let frames = debugger.stack_frames[&thread_id].clone();
 
-    let picker = Picker::new(frames, (), move |cx, frame, _action| {
+    let picker_title = String::from("DAP Stack Frame Picker");
+    let picker = Picker::new(picker_title, frames, (), move |cx, frame, _action| {
         let debugger = debugger!(cx.editor);
         // TODO: this should be simpler to find
         let pos = debugger.stack_frames[&thread_id]

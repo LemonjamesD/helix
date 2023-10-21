@@ -5,7 +5,10 @@ use helix_lsp::{
         self, CodeAction, CodeActionOrCommand, CodeActionTriggerKind, DiagnosticSeverity,
         NumberOrString,
     },
-    util::{diagnostic_to_lsp_diagnostic, lsp_range_to_range, range_to_lsp_range},
+    util::{
+        diagnostic_to_lsp_diagnostic, lsp_range_to_ops_range, lsp_range_to_range,
+        range_to_lsp_range,
+    },
     Client, OffsetEncoding,
 };
 use serde_json::Value;
@@ -23,6 +26,7 @@ use helix_core::{
 use helix_view::{
     document::{DocumentInlayHints, DocumentInlayHintsId, Mode},
     editor::Action,
+    graphics::Margin,
     theme::Style,
     Document, View,
 };
@@ -242,14 +246,20 @@ type SymbolPicker = Picker<SymbolInformationItem>;
 
 fn sym_picker(symbols: Vec<SymbolInformationItem>, current_path: Option<lsp::Url>) -> SymbolPicker {
     // TODO: drop current_path comparison and instead use workspace: bool flag?
-    Picker::new(symbols, current_path, move |cx, item, action| {
-        jump_to_location(
-            cx.editor,
-            &item.symbol.location,
-            item.offset_encoding,
-            action,
-        );
-    })
+    let picker_title = String::from("Symbol Picker");
+    Picker::new(
+        picker_title,
+        symbols,
+        current_path,
+        move |cx, item, action| {
+            jump_to_location(
+                cx.editor,
+                &item.symbol.location,
+                item.offset_encoding,
+                action,
+            );
+        },
+    )
     .with_preview(move |_editor, item| Some(location_to_file_location(&item.symbol.location)))
     .truncate_start(false)
 }
@@ -290,8 +300,28 @@ fn diag_picker(
         warning: cx.editor.theme.get("warning"),
         error: cx.editor.theme.get("error"),
     };
+    let mut informations = 0;
+    let mut warnings = 0;
+    let mut errors = 0;
+    let mut hints = 0;
 
+    flat_diag
+        .iter()
+        .filter_map(|i| i.diag.severity)
+        .for_each(|severity| match severity {
+            DiagnosticSeverity::INFORMATION => informations += 1,
+            DiagnosticSeverity::WARNING => warnings += 1,
+            DiagnosticSeverity::ERROR => errors += 1,
+            DiagnosticSeverity::HINT => hints += 1,
+            _ => (),
+        });
+
+    let picker_title = format!(
+        "Diagnostics: [{} E] [{} W] [{} I] [{} H]",
+        errors, warnings, informations, hints,
+    );
     Picker::new(
+        picker_title,
         flat_diag,
         (styles, format),
         move |cx,
@@ -744,7 +774,16 @@ pub fn code_action(cx: &mut Context) {
             });
             picker.move_down(); // pre-select the first item
 
-            let popup = Popup::new("code-action", picker).with_scrollbar(false);
+            let margin = if editor.menu_border {
+                Margin::vertical(1)
+            } else {
+                Margin::none()
+            };
+
+            let popup = Popup::new("code-action", picker)
+                .with_scrollbar(false)
+                .margin(margin);
+
             compositor.replace_or_push("code-action", popup);
         };
 
@@ -1029,9 +1068,15 @@ fn goto_impl(
             editor.set_error("No definition found.");
         }
         _locations => {
-            let picker = Picker::new(locations, cwdir, move |cx, location, action| {
-                jump_to_location(cx.editor, location, offset_encoding, action)
-            })
+            let picker_title = String::from("Goto Picker");
+            let picker = Picker::new(
+                picker_title,
+                locations,
+                cwdir,
+                move |cx, location, action| {
+                    jump_to_location(cx.editor, location, offset_encoding, action)
+                },
+            )
             .with_preview(move |_editor, location| Some(location_to_file_location(location)));
             compositor.push(Box::new(overlaid(picker)));
         }
@@ -1490,6 +1535,47 @@ pub fn select_references_to_symbol_under_cursor(cx: &mut Context) {
                 .collect();
             let selection = Selection::new(ranges, primary_index);
             doc.set_selection(view.id, selection);
+        },
+    );
+}
+
+pub fn highlight_symbol_under_cursor(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    let language_server =
+        language_server_with_feature!(cx.editor, doc, LanguageServerFeature::DocumentHighlight);
+    let offset_encoding = language_server.offset_encoding();
+
+    let pos = doc.position(view.id, offset_encoding);
+
+    let Some(future) = language_server.text_document_document_highlight(doc.identifier(), pos, None) else {
+        return;
+    };
+
+    cx.callback(
+        future,
+        move |editor, _compositor, response: Option<Vec<lsp::DocumentHighlight>>| {
+            let Some(highlights) = response else {
+                // Reset the cursor_word
+                editor.cursor_highlights = Arc::new(Vec::new());
+                return;
+            };
+            let (_, doc) = current!(editor);
+            let language_server = language_server_with_feature!(
+                editor,
+                doc,
+                LanguageServerFeature::DocumentHighlight
+            );
+            let offset_encoding = language_server.offset_encoding();
+            let text = doc.text();
+
+            editor.cursor_highlights = Arc::new(
+                highlights
+                    .iter()
+                    .filter_map(|highlight| {
+                        lsp_range_to_ops_range(text, highlight.range, offset_encoding)
+                    })
+                    .collect(),
+            );
         },
     );
 }

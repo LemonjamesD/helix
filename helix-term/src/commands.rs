@@ -26,7 +26,7 @@ use helix_core::{
     syntax::LanguageServerFeature,
     text_annotations::TextAnnotations,
     textobject,
-    tree_sitter::Node,
+    tree_sitter::{Node, Tree},
     unicode::width::UnicodeWidthChar,
     visual_offset_from_block, Deletion, LineEnding, Position, Range, Rope, RopeGraphemes,
     RopeReader, RopeSlice, Selection, SmallVec, Tendril, Transaction,
@@ -414,8 +414,11 @@ impl MappableCommand {
         reverse_selection_contents, "Reverse selections contents",
         expand_selection, "Expand selection to parent syntax node",
         shrink_selection, "Shrink selection to previously expanded syntax node",
-        select_next_sibling, "Select next sibling in syntax tree",
-        select_prev_sibling, "Select previous sibling in syntax tree",
+        select_next_sibling, "Select next sibling in the syntax tree",
+        select_prev_sibling, "Select previous sibling the in syntax tree",
+        select_all_siblings, "Select all siblings of the current node",
+        select_all_children, "Select all children of the current node",
+        select_all_children_in_selection, "Select all children of the current node that are contained in the current selection",
         jump_forward, "Jump forward on jumplist",
         jump_backward, "Jump backward on jumplist",
         save_selection, "Save current selection to jumplist",
@@ -490,6 +493,8 @@ impl MappableCommand {
         record_macro, "Record macro",
         replay_macro, "Replay macro",
         command_palette, "Open command palette",
+        open_or_focus_explorer, "Open or focus explorer",
+        reveal_current_file, "Reveal current file in explorer",
     );
 }
 
@@ -2264,9 +2269,27 @@ fn global_search(cx: &mut Context) {
                         });
                 });
 
+                let user_entered_regex = regex.to_string();
+                let case_sensitive = if smart_case {
+                    user_entered_regex
+                        .chars()
+                        .any(|char| char.is_ascii_uppercase())
+                } else {
+                    true
+                };
                 cx.jobs.callback(async move {
                     let call = move |_: &mut Editor, compositor: &mut Compositor| {
+                        let picker_title = format!(
+                            "Global Search: '{}' {}",
+                            regex,
+                            if case_sensitive {
+                                "[Case Sensitive]"
+                            } else {
+                                "[Case Insensitive]"
+                            }
+                        );
                         let picker = Picker::with_stream(
+                            picker_title,
                             picker,
                             injector,
                             move |cx, FileResult { path, line_num }, action| {
@@ -2681,6 +2704,49 @@ fn file_picker_in_current_directory(cx: &mut Context) {
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
+fn open_or_focus_explorer(cx: &mut Context) {
+    cx.callback = Some(Box::new(
+        |compositor: &mut Compositor, cx: &mut compositor::Context| {
+            if let Some(editor) = compositor.find::<ui::EditorView>() {
+                match editor.explorer.as_mut() {
+                    Some(explore) => explore.focus(),
+                    None => match ui::Explorer::new(cx) {
+                        Ok(explore) => editor.explorer = Some(explore),
+                        Err(err) => cx.editor.set_error(format!("{}", err)),
+                    },
+                }
+            }
+        },
+    ));
+}
+
+fn reveal_file(cx: &mut Context, path: Option<PathBuf>) {
+    cx.callback = Some(Box::new(
+        |compositor: &mut Compositor, cx: &mut compositor::Context| {
+            if let Some(editor) = compositor.find::<ui::EditorView>() {
+                (|| match editor.explorer.as_mut() {
+                    Some(explorer) => match path {
+                        Some(path) => explorer.reveal_file(path),
+                        None => explorer.reveal_current_file(cx),
+                    },
+                    None => {
+                        editor.explorer = Some(ui::Explorer::new(cx)?);
+                        if let Some(explorer) = editor.explorer.as_mut() {
+                            explorer.reveal_current_file(cx)?;
+                        }
+                        Ok(())
+                    }
+                })()
+                .unwrap_or_else(|err| cx.editor.set_error(err.to_string()))
+            }
+        },
+    ));
+}
+
+fn reveal_current_file(cx: &mut Context) {
+    reveal_file(cx, None)
+}
+
 fn buffer_picker(cx: &mut Context) {
     let current = view!(cx.editor).doc;
 
@@ -2735,7 +2801,8 @@ fn buffer_picker(cx: &mut Context) {
     // mru
     items.sort_unstable_by_key(|item| std::cmp::Reverse(item.focused_at));
 
-    let picker = Picker::new(items, (), |cx, meta, action| {
+    let picker_title = String::from("Buffer List");
+    let picker = Picker::new(picker_title, items, (), |cx, meta, action| {
         cx.editor.switch(meta.id, action);
     })
     .with_preview(|editor, meta| {
@@ -2812,7 +2879,9 @@ fn jumplist_picker(cx: &mut Context) {
         }
     };
 
+    let picker_title = String::from("Jumplist Picker");
     let picker = Picker::new(
+        picker_title,
         cx.editor
             .tree
             .views()
@@ -2889,32 +2958,38 @@ pub fn command_palette(cx: &mut Context) {
                 }
             }));
 
-            let picker = Picker::new(commands, keymap, move |cx, command, _action| {
-                let mut ctx = Context {
-                    register,
-                    count,
-                    editor: cx.editor,
-                    callback: None,
-                    on_next_key_callback: None,
-                    jobs: cx.jobs,
-                };
-                let focus = view!(ctx.editor).id;
+            let picker_title = String::from("Command Palette");
+            let picker = Picker::new(
+                picker_title,
+                commands,
+                keymap,
+                move |cx, command, _action| {
+                    let mut ctx = Context {
+                        register,
+                        count,
+                        editor: cx.editor,
+                        callback: None,
+                        on_next_key_callback: None,
+                        jobs: cx.jobs,
+                    };
+                    let focus = view!(ctx.editor).id;
 
-                command.execute(&mut ctx);
+                    command.execute(&mut ctx);
 
-                if ctx.editor.tree.contains(focus) {
-                    let config = ctx.editor.config();
-                    let mode = ctx.editor.mode();
-                    let view = view_mut!(ctx.editor, focus);
-                    let doc = doc_mut!(ctx.editor, &view.doc);
+                    if ctx.editor.tree.contains(focus) {
+                        let config = ctx.editor.config();
+                        let mode = ctx.editor.mode();
+                        let view = view_mut!(ctx.editor, focus);
+                        let doc = doc_mut!(ctx.editor, &view.doc);
 
-                    view.ensure_cursor_in_view(doc, config.scrolloff);
+                        view.ensure_cursor_in_view(doc, config.scrolloff);
 
-                    if mode != Mode::Insert {
-                        doc.append_changes_to_history(view);
+                        if mode != Mode::Insert {
+                            doc.append_changes_to_history(view);
+                        }
                     }
-                }
-            });
+                },
+            );
             compositor.push(Box::new(overlaid(picker)));
         },
     ));
@@ -4771,6 +4846,52 @@ pub fn extend_parent_node_end(cx: &mut Context) {
 
 pub fn extend_parent_node_start(cx: &mut Context) {
     move_node_bound_impl(cx, Direction::Backward, Movement::Extend)
+}
+
+fn select_all_impl<F>(editor: &mut Editor, select_fn: F)
+where
+    F: Fn(&Tree, RopeSlice, Selection) -> Selection,
+{
+    let (view, doc) = current!(editor);
+
+    if let Some(syntax) = doc.syntax() {
+        let text = doc.text().slice(..);
+        let current_selection = doc.selection(view.id);
+        let selection = select_fn(syntax.tree(), text, current_selection.clone());
+        doc.set_selection(view.id, selection);
+    }
+}
+
+fn select_all_siblings(cx: &mut Context) {
+    let motion = |editor: &mut Editor| {
+        select_all_impl(editor, object::select_all_siblings);
+    };
+
+    cx.editor.apply_motion(motion);
+}
+
+fn select_all_children_in_selection(cx: &mut Context) {
+    let motion = |editor: &mut Editor| {
+        select_all_impl(editor, |tree, text, selection| {
+            let all_children = object::select_all_children(tree, text, selection.clone());
+
+            if selection.contains(&all_children) {
+                all_children
+            } else {
+                selection
+            }
+        });
+    };
+
+    cx.editor.apply_motion(motion);
+}
+
+fn select_all_children(cx: &mut Context) {
+    let motion = |editor: &mut Editor| {
+        select_all_impl(editor, object::select_all_children);
+    };
+
+    cx.editor.apply_motion(motion);
 }
 
 fn match_brackets(cx: &mut Context) {
